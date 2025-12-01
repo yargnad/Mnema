@@ -1,6 +1,12 @@
 # Ignore node_modules
 node_modules/
 
+# Ignore large ONNX model files and build artifacts
+chronolog/src-tauri/resources/clip-vision.onnx
+chronolog/src-tauri/resources/resnet50-v2-7.onnx
+chronolog/src-tauri/target/
+chronolog/src-tauri/target/**
+
 # Ignore large ONNX model files
 chronolog/src-tauri/resources/clip-vision.onnx
 chronolog/src-tauri/resources/resnet50-v2-7.onnx

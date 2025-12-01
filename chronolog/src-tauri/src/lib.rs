@@ -16,64 +16,116 @@ use ort::value::Tensor;
 use ort::execution_providers::DirectMLExecutionProvider;
 use ndarray::Array4;
 
-// --- HELPER: Turn an Image into a Tensor (CLIP Vision) ---
-// CLIP typically uses: Resize to 224x224, then Normalize.
+// --- DATABASE IMPORTS (Corrected for LanceDB v0.5.0) ---
+use lancedb::Table; // FIX: TableRef is now just 'Table'
+use arrow::array::{RecordBatch, RecordBatchIterator, StringArray, FixedSizeListArray, Float32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use std::sync::Arc; // Needed for Arrow Schemas
+
+// --- HELPER: Preprocess Image for CLIP ---
 fn preprocess_for_clip(img: &image::DynamicImage) -> Array4<f32> {
-    // 1. Resize to 224x224
     let resized = img.resize_exact(224, 224, image::imageops::FilterType::Triangle);
-    
-    // 2. Prepare the tensor structure (Batch Size 1, 3 Channels, 224 Height, 224 Width)
     let mut input = Array4::zeros((1, 3, 224, 224));
-    
-    // 3. CLIP specific Normalization Constants
     let mean = [0.48145466, 0.4578275, 0.40821073];
     let std = [0.26862954, 0.26130258, 0.27577711];
 
-    // 4. Iterate pixels and fill the tensor
     for (x, y, pixel) in resized.pixels() {
         let r = (pixel[0] as f32 / 255.0 - mean[0]) / std[0];
         let g = (pixel[1] as f32 / 255.0 - mean[1]) / std[1];
         let b = (pixel[2] as f32 / 255.0 - mean[2]) / std[2];
-
-        // Standard ONNX format is NCHW (Batch, Channel, Height, Width)
         input[[0, 0, y as usize, x as usize]] = r;
         input[[0, 1, y as usize, x as usize]] = g;
         input[[0, 2, y as usize, x as usize]] = b;
     }
-
     input
 }
 
-// --- HELPER: Setup the Database ---
-fn init_db(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // 1. Resolve the path to the user's AppData folder
+// --- HELPER: Initialize LanceDB ---
+// FIX: Return Type is now 'Table', not 'TableRef'
+async fn init_lancedb(app_handle: &tauri::AppHandle) -> Result<(PathBuf, Table), String> {
     let app_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
+    let lancedb_path = app_dir.join("lancedb_store");
     
-    // 2. Create the directory if it doesn't exist
-    if !app_dir.exists() {
-        fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
+    if !lancedb_path.exists() {
+        fs::create_dir_all(&lancedb_path).map_err(|e| e.to_string())?;
     }
 
-    // 3. Connect to (or create) the SQLite database file
-    let db_path = app_dir.join("chronolog.db");
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let db = lancedb::connect(lancedb_path.to_str().unwrap())
+        .execute()
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // 4. Create the table if it doesn't exist
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS snapshots (
-            id TEXT PRIMARY KEY,
-            timestamp TEXT NOT NULL,
-            file_path TEXT NOT NULL
-        )",
-        [],
-    ).map_err(|e| e.to_string())?;
+    const VECTOR_SIZE: i32 = 512;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("timestamp", DataType::Utf8, false),
+        Field::new("file_path", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                VECTOR_SIZE,
+            ),
+            true,
+        ),
+    ]));
 
-    Ok(app_dir)
+    let table = db
+        .create_table("memories", RecordBatchIterator::new(vec![], schema.clone()))
+        .execute()
+        .await;
+
+    let table = match table {
+        Ok(t) => t,
+        Err(_) => db.open_table("memories").execute().await.map_err(|e| e.to_string())?,
+    };
+
+    println!("DEBUG: LanceDB initialized at {:?}", lancedb_path);
+    Ok((app_dir, table))
 }
 
+// --- HELPER: Save Memory to LanceDB ---
+// FIX: Input type is &Table
+async fn add_memory(table: &Table, id: String, timestamp: String, path: String, embedding: Vec<f32>) {
+    const VECTOR_SIZE: i32 = 512;
+    
+    let id_array = StringArray::from(vec![id]);
+    let ts_array = StringArray::from(vec![timestamp]);
+    let path_array = StringArray::from(vec![path]);
+    
+    let vector_values = Float32Array::from(embedding);
+    let fixed_size_list = FixedSizeListArray::new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        VECTOR_SIZE,
+        Arc::new(vector_values),
+        None,
+    );
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("timestamp", DataType::Utf8, false),
+        Field::new("file_path", DataType::Utf8, false),
+        Field::new("vector", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), VECTOR_SIZE), true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(id_array),
+            Arc::new(ts_array),
+            Arc::new(path_array),
+            Arc::new(fixed_size_list),
+        ],
+    ).unwrap();
+
+// Get the schema first
+    let schema = table.schema().await.unwrap();
+    let _ = table.add(RecordBatchIterator::new(vec![Ok(batch)], schema.clone())).execute().await;}
+
 // --- MAIN LOOP ---
-async fn start_screen_capture_loop(app_handle: tauri::AppHandle, app_dir: PathBuf, mut session: Session) {
-    println!("DEBUG: Starting Memory (Embedding) loop...");
+// FIX: Input type is Table
+async fn start_screen_capture_loop(app_handle: tauri::AppHandle, app_dir: PathBuf, mut session: Session, table: Table) {
+    println!("DEBUG: Starting ChronoLog Memory Core...");
     let images_dir = app_dir.join("snapshots");
     if !images_dir.exists() { let _ = fs::create_dir_all(&images_dir); }
 
@@ -82,12 +134,11 @@ async fn start_screen_capture_loop(app_handle: tauri::AppHandle, app_dir: PathBu
 
         if let Some(screen) = screens.first() {
             if let Ok(image_buffer) = screen.capture() {
-                // Prepare buffers
+                // UI Stream
                 let mut buffer = Vec::new();
                 let mut cursor = Cursor::new(&mut buffer);
                 let dynamic_image = image::DynamicImage::ImageRgba8(image_buffer);
                 
-                // --- STEP 1: UI Stream (Fast) ---
                 let thumbnail = dynamic_image.thumbnail(800, 600);
                 if thumbnail.write_to(&mut cursor, ImageOutputFormat::Png).is_ok() {
                      let base64_string = base64::engine::general_purpose::STANDARD.encode(&buffer);
@@ -95,46 +146,40 @@ async fn start_screen_capture_loop(app_handle: tauri::AppHandle, app_dir: PathBu
                      let _ = app_handle.emit("new-screenshot", data_url);
                 }
 
-                // --- STEP 2: The "Thought" (CLIP Inference) ---
+                // AI Inference
                 let input_tensor_values = preprocess_for_clip(&dynamic_image);
                 let input_tensor = Tensor::from_array(input_tensor_values).unwrap();
-                
-                // We dynamically grab the first input name from the model
-                // This makes it work regardless of whether the model calls it "pixel_values" or "data"
                 let input_name = session.inputs[0].name.clone();
                 
+                let mut embedding_vec: Vec<f32> = Vec::new();
+
                 match session.run(ort::inputs![input_name => input_tensor]) {
                     Ok(outputs) => {
-                        // Grab the embedding vector (the first output)
                         let (_, output_value) = outputs.iter().next().unwrap();
                         let output_tensor = output_value.try_extract_tensor::<f32>().unwrap();
                         let (_, embedding) = output_tensor; 
                         
-                        // "embedding" is now a slice of 512 numbers representing the MEANING of your screen.
-                        println!("DEBUG: Generated Memory Fingerprint (Vector Size: {})", embedding.len());
-                        // Print the first few numbers just to prove it's mathing
-                        if embedding.len() > 3 {
-                            println!("DEBUG: Vector Start: [{:.4}, {:.4}, {:.4}...]", embedding[0], embedding[1], embedding[2]);
-                        }
+                        embedding_vec = embedding.to_vec();
+                        
+                        // println!("DEBUG: Memory Vector Generated (Size: {})", embedding_vec.len());
                     },
                     Err(e) => println!("Inferencing Error: {}", e),
                 }
 
-                // --- STEP 3: Persistence (Slow) ---
-                let id = uuid::Uuid::new_v4().to_string();
-                let now = Local::now();
-                let timestamp_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
-                let filename = format!("{}.png", id);
-                let file_path = images_dir.join(&filename);
+                // Persistence
+                if !embedding_vec.is_empty() {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let now = Local::now();
+                    let timestamp_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+                    let filename = format!("{}.png", id);
+                    let file_path = images_dir.join(&filename);
 
-                if dynamic_image.save(&file_path).is_ok() {
-                    let db_path = app_dir.join("chronolog.db");
-                    if let Ok(conn) = Connection::open(db_path) {
+                    if dynamic_image.save(&file_path).is_ok() {
                         let path_string = file_path.to_string_lossy().to_string();
-                        let _ = conn.execute(
-                            "INSERT INTO snapshots (id, timestamp, file_path) VALUES (?1, ?2, ?3)",
-                            params![id, timestamp_str, path_string],
-                        );
+                        
+                        // SAVE TO VECTOR DB
+                        add_memory(&table, id, timestamp_str.clone(), path_string, embedding_vec).await;
+                        println!("DEBUG: Memory Encoded & Saved. [{}]", timestamp_str);
                     }
                 }
             }
@@ -145,21 +190,17 @@ async fn start_screen_capture_loop(app_handle: tauri::AppHandle, app_dir: PathBu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 1. Initialize ONNX Runtime
     ort::init().with_name("ChronoLog").commit().expect("Failed to init ONNX");
 
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // 2. Load the CLIP Model
-            // Ensure the file 'clip-vision.onnx' is in src-tauri/resources/
             let resource_path = app.path().resolve("resources/clip-vision.onnx", tauri::path::BaseDirectory::Resource)
                 .expect("failed to resolve resource");
 
             println!("DEBUG: Loading CLIP Model...");
             let session = Session::builder()? 
-                // Attempt Hardware Acceleration
                 .with_execution_providers([DirectMLExecutionProvider::default().build()])?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 .with_intra_threads(4)?
@@ -167,14 +208,15 @@ pub fn run() {
 
             println!("DEBUG: CLIP Brain loaded.");
             
-            match init_db(&handle) {
-                Ok(app_dir) => {
-                     tauri::async_runtime::spawn(async move {
-                        start_screen_capture_loop(handle, app_dir, session).await;
-                    });
+            tauri::async_runtime::spawn(async move {
+                match init_lancedb(&handle).await {
+                    Ok((app_dir, table)) => {
+                        start_screen_capture_loop(handle, app_dir, session, table).await;
+                    },
+                    Err(e) => println!("CRITICAL ERROR: LanceDB Init failed: {}", e),
                 }
-                Err(e) => println!("CRITICAL ERROR: DB Init failed: {}", e),
-            }
+            });
+
             Ok(())
         })
         .plugin(tauri_plugin_shell::init())
