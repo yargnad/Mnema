@@ -7,20 +7,28 @@ use std::io::Cursor;
 use image::{ImageOutputFormat, GenericImageView};
 use base64::Engine;
 use chrono::Local;
-use rusqlite::{params, Connection};
 
-// ORT Imports
+// --- AI & Math Imports ---
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel; 
 use ort::value::Tensor;
 use ort::execution_providers::DirectMLExecutionProvider;
-use ndarray::Array4;
+use ndarray::{Array2, Array4};
+use std::sync::Mutex; 
 
-// --- DATABASE IMPORTS (Corrected for LanceDB v0.5.0) ---
-use lancedb::Table; // FIX: TableRef is now just 'Table'
-use arrow::array::{RecordBatch, RecordBatchIterator, StringArray, FixedSizeListArray, Float32Array};
+// --- DATABASE IMPORTS ---
+use lancedb::Table;
+use lancedb::query::{QueryBase, ExecutableQuery, Select}; // Import traits for query methods
+use arrow::array::{RecordBatch, RecordBatchIterator};
 use arrow::datatypes::{DataType, Field, Schema};
-use std::sync::Arc; // Needed for Arrow Schemas
+use std::sync::Arc;
+use futures::StreamExt; // For async stream iteration
+
+// --- GLOBAL STATE STRUCT (The Brain & Memory Manager) ---
+pub struct AppState {
+    pub db_table: Option<Table>,
+    pub text_session: Option<Session>,
+}
 
 // --- HELPER: Preprocess Image for CLIP ---
 fn preprocess_for_clip(img: &image::DynamicImage) -> Array4<f32> {
@@ -41,7 +49,6 @@ fn preprocess_for_clip(img: &image::DynamicImage) -> Array4<f32> {
 }
 
 // --- HELPER: Initialize LanceDB ---
-// FIX: Return Type is now 'Table', not 'TableRef'
 async fn init_lancedb(app_handle: &tauri::AppHandle) -> Result<(PathBuf, Table), String> {
     let app_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
     let lancedb_path = app_dir.join("lancedb_store");
@@ -85,27 +92,26 @@ async fn init_lancedb(app_handle: &tauri::AppHandle) -> Result<(PathBuf, Table),
 }
 
 // --- HELPER: Save Memory to LanceDB ---
-// FIX: Input type is &Table
 async fn add_memory(table: &Table, id: String, timestamp: String, path: String, embedding: Vec<f32>) {
     const VECTOR_SIZE: i32 = 512;
     
-    let id_array = StringArray::from(vec![id]);
-    let ts_array = StringArray::from(vec![timestamp]);
-    let path_array = StringArray::from(vec![path]);
+    let id_array = arrow::array::StringArray::from(vec![id]);
+    let ts_array = arrow::array::StringArray::from(vec![timestamp]);
+    let path_array = arrow::array::StringArray::from(vec![path]);
     
-    let vector_values = Float32Array::from(embedding);
-    let fixed_size_list = FixedSizeListArray::new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
+    let vector_values = arrow::array::Float32Array::from(embedding);
+    let fixed_size_list = arrow::array::FixedSizeListArray::new(
+        Arc::new(arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Float32, true)),
         VECTOR_SIZE,
         Arc::new(vector_values),
         None,
     );
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Utf8, false),
-        Field::new("file_path", DataType::Utf8, false),
-        Field::new("vector", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), VECTOR_SIZE), true),
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("timestamp", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("file_path", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("vector", arrow::datatypes::DataType::FixedSizeList(Arc::new(arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Float32, true)), VECTOR_SIZE), true),
     ]));
 
     let batch = RecordBatch::try_new(
@@ -118,12 +124,11 @@ async fn add_memory(table: &Table, id: String, timestamp: String, path: String, 
         ],
     ).unwrap();
 
-// Get the schema first
     let schema = table.schema().await.unwrap();
-    let _ = table.add(RecordBatchIterator::new(vec![Ok(batch)], schema.clone())).execute().await;}
+    let _ = table.add(RecordBatchIterator::new(vec![Ok(batch)], schema.clone())).execute().await;
+}
 
 // --- MAIN LOOP ---
-// FIX: Input type is Table
 async fn start_screen_capture_loop(app_handle: tauri::AppHandle, app_dir: PathBuf, mut session: Session, table: Table) {
     println!("DEBUG: Starting ChronoLog Memory Core...");
     let images_dir = app_dir.join("snapshots");
@@ -188,30 +193,134 @@ async fn start_screen_capture_loop(app_handle: tauri::AppHandle, app_dir: PathBu
     }
 }
 
+
+// --- THE SEARCH COMMAND (Frontend API) ---
+// 1. Text preprocessing helper (Mock Tokenizer/Vector Converter)
+fn text_to_tensor(text: &str) -> ndarray::Array2<i64> {
+    let _ = text; 
+    let token_ids: Vec<i64> = vec![
+        49406, 
+        11, 230, 2432, 234, 12, 11, 34, 45, 60, 484, 
+    ];
+    let padding_size = 77 - token_ids.len();
+    let tokens: Vec<i64> = token_ids.into_iter().chain(std::iter::repeat(0).take(padding_size)).collect();
+    
+    ndarray::Array2::from_shape_vec((1, 77), tokens.into_iter().take(77).collect()).unwrap()
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct SearchResult {
+    id: String,
+    timestamp: String,
+    file_path: String,
+    score: f32, // Lower score = more relevant
+}
+
+#[tauri::command]
+async fn search_memories(state: tauri::State<'_, Mutex<AppState>>, query: String) -> Result<Vec<SearchResult>, String> {
+    println!("DEBUG: Received search query: '{}'", query);
+
+    // Extract what we need from state while holding the lock, then drop it before async operations
+    let (table_clone, text_embedding) = {
+        let mut app_state = state.lock().unwrap();
+        let table_clone = app_state.db_table.as_ref().ok_or("Database not yet initialized")?.clone();
+        let text_session = app_state.text_session.as_mut().ok_or("Text Model not yet loaded")?;
+
+        // 1. Convert the user's text query into a search vector (Fingerprint)
+        let text_input_array = text_to_tensor(&query);
+        let text_input_tensor = Tensor::from_array(text_input_array).unwrap();
+        
+        let input_name = text_session.inputs[0].name.clone(); 
+
+        let text_outputs = text_session.run(ort::inputs![input_name => text_input_tensor]).map_err(|e| e.to_string())?;
+        
+        let (_, output_value) = text_outputs.iter().next().unwrap();
+        let output_tensor = output_value.try_extract_tensor::<f32>().unwrap();
+        let (_, embedding_slice) = output_tensor;
+        let text_embedding: Vec<f32> = embedding_slice.to_vec();
+
+        (table_clone, text_embedding)
+    }; // Lock is dropped here
+
+    // 2. Query LanceDB for similar vectors (async operations happen after lock is dropped)
+    let results = table_clone 
+        .query() 
+        .nearest_to(text_embedding) 
+        .map_err(|e| format!("Query builder error: {}", e))? 
+        .limit(10)
+        .select(Select::columns(&["id", "timestamp", "file_path"])) 
+        .execute()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 3. Format results for the Frontend
+    let mut search_results: Vec<SearchResult> = Vec::new();
+    let mut stream = results;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(|e| e.to_string())?;
+        
+        let id_col = batch.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        let ts_col = batch.column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        let fp_col = batch.column(2).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+
+        for i in 0..batch.num_rows() {
+            let id = id_col.value(i).to_string();
+            let timestamp = ts_col.value(i).to_string();
+            let file_path = fp_col.value(i).to_string();
+            let score = 0.0; // Score not available in this query result format
+
+            search_results.push(SearchResult { id, timestamp, file_path, score });
+        }
+    }
+
+    println!("DEBUG: Search executed. Found {} results.", search_results.len());
+    Ok(search_results)
+}
+
+// --- RUN ENTRY POINT ---
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     ort::init().with_name("ChronoLog").commit().expect("Failed to init ONNX");
 
     tauri::Builder::default()
+        .manage(Mutex::new(AppState { 
+            db_table: None, 
+            text_session: None,
+        }))
         .setup(|app| {
             let handle = app.handle().clone();
 
-            let resource_path = app.path().resolve("resources/clip-vision.onnx", tauri::path::BaseDirectory::Resource)
-                .expect("failed to resolve resource");
+            let vision_path = app.path().resolve("resources/clip-vision.onnx", tauri::path::BaseDirectory::Resource)
+                .expect("failed to resolve vision model");
+            let text_path = app.path().resolve("resources/clip-text.onnx", tauri::path::BaseDirectory::Resource)
+                .expect("failed to resolve text model");
 
-            println!("DEBUG: Loading CLIP Model...");
-            let session = Session::builder()? 
+            println!("DEBUG: Loading CLIP Vision Model...");
+            let vision_session = Session::builder()? 
                 .with_execution_providers([DirectMLExecutionProvider::default().build()])?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(4)?
-                .commit_from_file(resource_path)?;
-
-            println!("DEBUG: CLIP Brain loaded.");
+                .commit_from_file(vision_path)?;
             
+            println!("DEBUG: Loading CLIP Text Model...");
+            let text_session = Session::builder()?
+                .with_execution_providers([DirectMLExecutionProvider::default().build()])?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .commit_from_file(text_path)?;
+
+            let app_state_mutex = app.state::<Mutex<AppState>>();
+            app_state_mutex.lock().unwrap().text_session = Some(text_session);
+
+            // Clone handle again for use in async block
+            let handle_for_state = handle.clone();
+
             tauri::async_runtime::spawn(async move {
                 match init_lancedb(&handle).await {
                     Ok((app_dir, table)) => {
-                        start_screen_capture_loop(handle, app_dir, session, table).await;
+                        // Use handle to access state instead of app
+                        handle_for_state.state::<Mutex<AppState>>().lock().unwrap().db_table = Some(table.clone());
+
+                        start_screen_capture_loop(handle, app_dir, vision_session, table).await;
                     },
                     Err(e) => println!("CRITICAL ERROR: LanceDB Init failed: {}", e),
                 }
@@ -219,7 +328,7 @@ pub fn run() {
 
             Ok(())
         })
-        .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![search_memories])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
