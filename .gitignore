@@ -12,3 +12,5 @@ chronolog/src-tauri/target/**
 chronolog/src-tauri/resources/clip-vision.onnx
 chronolog/src-tauri/resources/resnet50-v2-7.onnx
 chronolog/src-tauri/resources/clip-text.onnx
+
+PROPOSED_CHANGES.md
