@@ -1,11 +1,12 @@
 # Ignore node_modules
 node_modules/
 
-# Ignore ONNX model files everywhere
+# Ignore ONNX model files everywhere, but allow the pinned assets inside src-tauri/resources
 *.onnx
-# Future OCR resources (directory and files)
-mnema/src-tauri/resources/trocr-base/
-mnema/src-tauri/resources/trocr-base/**
+!mnema/src-tauri/resources/
+!mnema/src-tauri/resources/**
+# Temporary local-only AI payloads (remove when ready to commit resources)
+mnema/src-tauri/resources/**
 mnema/src-tauri/target/
 mnema/src-tauri/target/**
 mnema/src-tauri/onnxruntime.dll

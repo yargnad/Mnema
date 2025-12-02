@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "pretauri": "node ./scripts/sync-onnxruntime.mjs",
+    "sync-onnxruntime": "node ./scripts/sync-onnxruntime.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {

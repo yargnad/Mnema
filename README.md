@@ -82,6 +82,12 @@ We believe the world has become too motivated by capitalist gains at the expense
     npm run tauri dev
     ```
 
+### Bundled ONNX Runtime
+
+- The repository tracks a pinned copy of **ONNX Runtime 1.22.0** under `mnema/src-tauri/resources/onnxruntime/` so every build uses the same DirectML binaries.
+- Every `npm run tauri ...` call automatically runs `npm run sync-onnxruntime`, which copies the canonical DLL next to the compiled binary (and into `src-tauri/onnxruntime.dll`, which stays git-ignored).
+- If you see an error about a missing runtime DLL, run `npm run sync-onnxruntime` manually, then restart the Tauri process.
+
 ## 🗺️ Roadmap
 
 - [x] **Phase 0 — Pulse**

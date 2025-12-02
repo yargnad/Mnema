@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
+use tauri::path::BaseDirectory;
 use screenshots::Screen;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use image::{ImageOutputFormat, GenericImageView};
 use base64::Engine;
 use chrono::Local;
@@ -13,7 +14,7 @@ use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel; 
 use ort::value::Tensor;
 use ort::execution_providers::DirectMLExecutionProvider;
-use ndarray::{Array2, Array4};
+use ndarray::Array4;
 use std::sync::Mutex; 
 
 // --- DATABASE IMPORTS ---
@@ -278,17 +279,67 @@ async fn search_memories(state: tauri::State<'_, Mutex<AppState>>, query: String
     Ok(search_results)
 }
 
+fn prepare_onnxruntime(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_dir = app
+        .path()
+        .resolve("resources/onnxruntime", BaseDirectory::Resource)?;
+    let dll_path = runtime_dir.join("onnxruntime.dll");
+
+    if !dll_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Pinned ONNX Runtime DLL missing at {}. Run `npm run sync-onnxruntime` to regenerate it.",
+                dll_path.display()
+            ),
+        )
+        .into());
+    }
+
+    let normalize = |path: &PathBuf| -> Result<String, io::Error> {
+        let raw = path
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Runtime path contains invalid UTF-8"))?;
+        Ok(raw.trim_start_matches("\\\\?\\").to_string())
+    };
+
+    let runtime_dir_str = normalize(&runtime_dir)?;
+    let dll_path_str = normalize(&dll_path)?;
+
+    std::env::set_var("ORT_DYLIB_PATH", &dll_path_str);
+
+    let path_value = std::env::var("PATH").unwrap_or_default();
+    let already_present = path_value
+        .split(';')
+        .any(|segment| segment.eq_ignore_ascii_case(&runtime_dir_str));
+    if !already_present {
+        let updated = if path_value.is_empty() {
+            runtime_dir_str.clone()
+        } else {
+            format!("{};{}", runtime_dir_str, path_value)
+        };
+        std::env::set_var("PATH", updated);
+    }
+
+    ort::init()
+        .with_name("Mnema")
+        .commit()
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("Failed to initialize ONNX Runtime: {err}")))?;
+
+    Ok(())
+}
+
 // --- RUN ENTRY POINT ---
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    ort::init().with_name("Mnema").commit().expect("Failed to init ONNX");
-
     tauri::Builder::default()
         .manage(Mutex::new(AppState { 
             db_table: None, 
             text_session: None,
         }))
         .setup(|app| {
+            prepare_onnxruntime(&app.handle())?;
+
             let handle = app.handle().clone();
 
             let vision_path = app.path().resolve("resources/clip-vision.onnx", tauri::path::BaseDirectory::Resource)
