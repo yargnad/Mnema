@@ -10,3 +10,15 @@ mnema/src-tauri/resources/**
 mnema/src-tauri/target/
 mnema/src-tauri/target/**
 mnema/src-tauri/onnxruntime.dll
+
+# Ignore large local model/runtime resources and build artifacts
+.cargo/resources/
+resources/
+*.onnx
+*.gguf
+*.dll
+*.model
+*.bpe
+
+# Patches and vendored source build outputs (kept locally)
+patches/
